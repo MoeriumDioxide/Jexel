@@ -27,7 +27,7 @@
     <SelfContained>false</SelfContained>
     <DefaultLanguage>zh-CN</DefaultLanguage>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>1.0.0</Version>
+    <Version>0.1.0</Version>
     <Product>Jexel</Product>
     <AssemblyTitle>Jexel — JPEG XL 转换器</AssemblyTitle>
     <Company>Jexel</Company>
