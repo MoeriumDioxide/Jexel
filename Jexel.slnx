@@ -1,0 +1,17 @@
+<Solution>
+  <!--
+    WinUI 3 不支持 AnyCPU，必须显式声明 x64 / ARM64 平台，
+    否则解决方案级构建会把应用输出到与单项目构建不同的目录。
+  -->
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="ARM64" />
+  </Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/Jexel.App/Jexel.App.csproj" />
+    <Project Path="src/Jexel.Core/Jexel.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Jexel.SmokeTest/Jexel.SmokeTest.csproj" />
+  </Folder>
+</Solution>

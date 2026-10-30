@@ -1,0 +1,30 @@
+# 默认由 Git 自动判定文本文件，并统一以 CRLF 检出（Windows 桌面项目）
+* text=auto eol=crlf
+
+# ---------- 文本文件 ----------
+*.cs             text diff=csharp
+*.xaml           text
+*.csproj         text
+*.slnx           text
+*.props          text
+*.targets        text
+*.json           text
+*.yml            text
+*.yaml           text
+*.md             text
+*.xml            text
+*.manifest       text
+*.editorconfig   text
+LICENSE          text
+
+# ---------- 二进制文件（禁止换行符转换与文本 diff）----------
+*.ico            binary
+*.png            binary
+*.jpg            binary
+*.jpeg           binary
+*.gif            binary
+*.webp            binary
+*.jxl            binary
+*.dll            binary
+*.exe            binary
+*.pdb            binary
