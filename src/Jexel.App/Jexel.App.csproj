@@ -33,7 +33,7 @@
     -->
     <SatelliteResourceLanguages>zh-Hans;zh-Hant;en</SatelliteResourceLanguages>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Product>Jexel</Product>
     <AssemblyTitle>Jexel — JPEG XL 转换器</AssemblyTitle>
     <Company>Jexel</Company>
@@ -63,6 +63,21 @@
   <ItemGroup>
     <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!--
+    WinUI 3 的项目 PRI（XAML 资源索引）只在 Build 阶段生成到输出目录，
+    `dotnet publish` 不会把它复制到发布目录。缺少它时发布版会在
+    MainWindow.InitializeComponent() 抛 XamlParseException 并直接崩溃，
+    因此这里显式把它加入发布项。
+  -->
+  <Target Name="IncludeProjectPriInPublish" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup Condition="Exists('$(TargetDir)$(TargetName).pri')">
+      <ResolvedFileToPublish Include="$(TargetDir)$(TargetName).pri">
+        <RelativePath>$(TargetName).pri</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 
   <!--
     发布时只保留中文与英文的 WinUI 本地化资源。
