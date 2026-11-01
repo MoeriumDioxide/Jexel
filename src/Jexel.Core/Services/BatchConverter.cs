@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ImageMagick;
 using Jexel.Core.Models;
 
 namespace Jexel.Core.Services;
@@ -23,14 +24,22 @@ public sealed record ConversionProgress(
 }
 
 /// <summary>
-/// 串行批量转换器。
+/// 批量转换器。
 /// <para>
-/// 刻意采用串行执行：libjxl 自身已使用多线程，并行处理多个文件只会造成线程争抢，
-/// 既不会更快，也会让内存峰值与进度显示都变得不可控。
+/// 并发策略：只有**小图**才会并行编码，大图仍然独占串行执行。
+/// 理由是 libjxl 对大图本身就能吃满多核，再并行只会让多个任务互相争抢线程；
+/// 而小图的图块不足以喂满线程池，串行处理会浪费 CPU。
+/// </para>
+/// <para>
+/// 并行时同步下调 libjxl 的线程配额（核心数 ÷ 并发数），避免每个任务都尝试开满线程池
+/// 造成过度订阅；串行处理大图时再恢复为不限制。
 /// </para>
 /// </summary>
 public sealed class BatchConverter
 {
+    /// <summary>允许并行处理的像素上限：100 万像素。</summary>
+    public const long SmallImagePixelCount = 1_000_000;
+
     private readonly JxlEncoder _encoder;
 
     /// <summary>创建批量转换器。</summary>
@@ -59,10 +68,14 @@ public sealed class BatchConverter
 
         var stopwatch = Stopwatch.StartNew();
         var outcomes = new List<ConversionOutcome>(plan.Count);
+        var outcomeGate = new object();
         var runnable = plan.Where(static p => p.Status == PlanItemStatus.Ready).ToList();
         var total = runnable.Count;
         var completed = 0;
         var canceled = false;
+        var parallelism = ResolveParallelism(runnable, options);
+        var originalThreadLimit = ResourceLimits.Thread;
+        var running = new List<Task>(parallelism);
 
         // 不可执行的项目也要给出结果，界面才能完整展示每一行的最终状态。
         foreach (var item in plan.Where(static p => p.Status != PlanItemStatus.Ready))
@@ -84,43 +97,159 @@ public sealed class BatchConverter
                 item.Message));
         }
 
-        foreach (var item in runnable)
+        try
         {
-            if (cancellationToken.IsCancellationRequested)
+            for (var index = 0; index < runnable.Count; index++)
             {
-                canceled = true;
-                outcomes.Add(new ConversionOutcome(
-                    item.SourcePath, item.DestinationPath, ConversionState.Canceled,
-                    item.SourceInfo?.FileSize ?? 0, 0, TimeSpan.Zero, "已取消"));
-                completed++;
-                progress?.Report(new ConversionProgress(completed, total, item.SourceFileName, null, item.SourcePath));
-                continue;
+                var item = runnable[index];
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    // 先让在跑的任务结束，再把剩余项统一标记为取消。
+                    await DrainAsync().ConfigureAwait(false);
+                    canceled = true;
+
+                    for (var rest = index; rest < runnable.Count; rest++)
+                    {
+                        var pending = runnable[rest];
+                        Record(
+                            new ConversionOutcome(
+                                pending.SourcePath, pending.DestinationPath, ConversionState.Canceled,
+                                pending.SourceInfo?.FileSize ?? 0, 0, TimeSpan.Zero, "已取消"),
+                            pending);
+                    }
+
+                    break;
+                }
+
+                // 缺少目标路径说明输出位置尚未配置——记为跳过而不是中断整批任务。
+                if (item.DestinationPath is not { } destination)
+                {
+                    Record(
+                        new ConversionOutcome(
+                            item.SourcePath, null, ConversionState.Skipped,
+                            item.SourceInfo?.FileSize ?? 0, 0, TimeSpan.Zero,
+                            item.Message ?? "未配置输出位置。"),
+                        item);
+                    continue;
+                }
+
+                if (parallelism == 1 || !IsSmallImage(item))
+                {
+                    // 大图独占：先等并行批次收尾，再把完整的线程配额交还给 libjxl。
+                    await DrainAsync().ConfigureAwait(false);
+                    ApplyThreadBudget(1);
+                    await EncodeAsync(item, destination).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (running.Count >= parallelism)
+                {
+                    await DrainAsync().ConfigureAwait(false);
+                }
+
+                ApplyThreadBudget(parallelism);
+                progress?.Report(new ConversionProgress(
+                    Volatile.Read(ref completed), total, item.SourceFileName, null, item.SourcePath));
+
+                running.Add(EncodeAsync(item, destination));
             }
 
-            // 缺少目标路径说明输出位置尚未配置——记为跳过而不是中断整批任务。
-            if (item.DestinationPath is not { } destination)
-            {
-                outcomes.Add(new ConversionOutcome(
-                    item.SourcePath, null, ConversionState.Skipped,
-                    item.SourceInfo?.FileSize ?? 0, 0, TimeSpan.Zero,
-                    item.Message ?? "未配置输出位置。"));
-                completed++;
-                progress?.Report(new ConversionProgress(completed, total, item.SourceFileName, null, item.SourcePath));
-                continue;
-            }
-
-            progress?.Report(new ConversionProgress(completed, total, item.SourceFileName, null));
-
-            var outcome = await _encoder
-                .EncodeAsync(item.SourcePath, destination, options, cancellationToken)
-                .ConfigureAwait(false);
-
-            outcomes.Add(outcome);
-            completed++;
-            progress?.Report(new ConversionProgress(completed, total, item.SourceFileName, outcome));
+            await DrainAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            // 线程配额是进程级全局设置，任何情况下都必须还原。
+            ResourceLimits.Thread = originalThreadLimit;
         }
 
         stopwatch.Stop();
         return new ConversionSummary(outcomes, stopwatch.Elapsed, canceled);
+
+        async Task EncodeAsync(ConversionPlanItem item, string destination)
+        {
+            try
+            {
+                var outcome = await _encoder
+                    .EncodeAsync(item.SourcePath, destination, options, cancellationToken)
+                    .ConfigureAwait(false);
+
+                Record(outcome, item);
+            }
+            catch (Exception ex)
+            {
+                // 编码器内部已经捕获业务异常，这里只兜底，防止任务异常逃逸使 Task.WhenAll 抛出。
+                Record(
+                    new ConversionOutcome(
+                        item.SourcePath, destination, ConversionState.Failed,
+                        item.SourceInfo?.FileSize ?? 0, 0, TimeSpan.Zero, ex.Message),
+                    item);
+            }
+        }
+
+        void Record(ConversionOutcome outcome, ConversionPlanItem item)
+        {
+            // 并行任务会在不同线程上完成，结果列表与计数都必须同步访问。
+            lock (outcomeGate)
+            {
+                outcomes.Add(outcome);
+            }
+
+            var done = Interlocked.Increment(ref completed);
+            progress?.Report(new ConversionProgress(
+                done, total, item.SourceFileName, outcome, item.SourcePath));
+        }
+
+        async Task DrainAsync()
+        {
+            if (running.Count == 0)
+            {
+                return;
+            }
+
+            await Task.WhenAll(running).ConfigureAwait(false);
+            running.Clear();
+        }
+    }
+
+    /// <summary>
+    /// 计算本次批量的并发度。
+    /// 用户显式指定时以其为准，否则只在存在多张小图时启用自动并行。
+    /// </summary>
+    private static int ResolveParallelism(
+        IReadOnlyList<ConversionPlanItem> runnable,
+        ConversionOptions options)
+    {
+        if (options.MaxParallelism > 0)
+        {
+            return Math.Clamp(options.MaxParallelism, 1, ConversionOptions.MaxParallelismLimit);
+        }
+
+        var smallCount = runnable.Count(static item => IsSmallImage(item));
+        if (smallCount < 2)
+        {
+            return 1;
+        }
+
+        // 留一半核心给系统与界面线程，最多 4 路——小图并行的收益在此之前就已经饱和。
+        return Math.Clamp(Environment.ProcessorCount / 2, 2, 4);
+    }
+
+    private static bool IsSmallImage(ConversionPlanItem item)
+    {
+        if (item.SourceInfo is not { } info)
+        {
+            return false;
+        }
+
+        return (long)info.Width * info.Height <= SmallImagePixelCount;
+    }
+
+    /// <summary>调整 libjxl 可用的工作线程数；0 表示不限制（用满所有核心）。</summary>
+    private static void ApplyThreadBudget(int parallelism)
+    {
+        ResourceLimits.Thread = parallelism <= 1
+            ? 0UL
+            : (ulong)Math.Max(1, Environment.ProcessorCount / parallelism);
     }
 }

@@ -26,6 +26,12 @@
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <DefaultLanguage>zh-CN</DefaultLanguage>
+    <!--
+      支持语言只有中文与英文。
+      SatelliteResourceLanguages 控制 NuGet 包带入的卫星资源程序集，
+      发布产物的 WinUI .mui 目录由下面的 TrimUnusedLanguageResources 目标裁剪。
+    -->
+    <SatelliteResourceLanguages>zh-Hans;zh-Hant;en</SatelliteResourceLanguages>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <Version>0.1.0</Version>
     <Product>Jexel</Product>
@@ -57,5 +63,25 @@
   <ItemGroup>
     <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!--
+    发布时只保留中文与英文的 WinUI 本地化资源。
+    Windows App SDK 自包含发布会带入 90 个语言的 .mui 与同名目录，对本工具没有意义，
+    删除后分发包体积明显减小。语言目录名形如 de-DE、sr-Cyrl-BA，
+    因此用 BCP-47 形状的正则匹配，避免误删 Assets、NpuDetect、Microsoft.UI.Xaml 等目录。
+  -->
+  <Target Name="TrimUnusedLanguageResources" AfterTargets="Publish">
+    <ItemGroup>
+      <_JexelPublishedFile Include="$(PublishDir)**\*" />
+      <_JexelUnusedLanguageFile
+          Include="@(_JexelPublishedFile)"
+          Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('%(_JexelPublishedFile.RecursiveDir)', '^(?!zh-CN[\\/]|zh-TW[\\/]|en-us[\\/]|en-GB[\\/])[A-Za-z]{2,3}(-[A-Za-z0-9]+)+[\\/]'))" />
+      <_JexelUnusedLanguageDir Include="@(_JexelUnusedLanguageFile->'%(RootDir)%(Directory)')" />
+    </ItemGroup>
+
+    <Message Importance="high" Text="Jexel: 移除 @(_JexelUnusedLanguageFile->Count()) 个非中英文语言资源文件" />
+    <Delete Files="@(_JexelUnusedLanguageFile)" />
+    <RemoveDir Directories="@(_JexelUnusedLanguageDir)" />
+  </Target>
 
 </Project>

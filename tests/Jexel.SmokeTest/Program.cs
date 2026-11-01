@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using ImageMagick;
 using Jexel.Core.Models;
@@ -300,6 +302,10 @@ var cancelOptions = new ConversionOptions
 {
     Location = OutputLocationMode.CustomFolder,
     OutputFolder = Path.Combine(root, "cancel-out"),
+
+    // 取消语义在串行路径上验证：并行时会有多张图同时开始，
+    // "取消前是否已有文件完成"取决于调度时序，不适合写成固定断言。
+    MaxParallelism = 1,
 };
 var cancelPlan = ConversionPlanner.Build(cancelFiles, cancelOptions);
 
@@ -321,6 +327,199 @@ Console.WriteLine();
 Console.WriteLine("== 9. 临时文件清理 ==");
 var leftovers = Directory.EnumerateFiles(outputDir, ".*.jxl", SearchOption.TopDirectoryOnly).ToList();
 Check("输出目录没有残留临时文件", leftovers.Count == 0, string.Join(", ", leftovers));
+
+Console.WriteLine();
+Console.WriteLine("== 10. 中英文文件名与常见格式矩阵 ==");
+
+var formatMatrix = new (string Extension, MagickFormat Format)[]
+{
+    (".png", MagickFormat.Png),
+    (".jpg", MagickFormat.Jpeg),
+    (".webp", MagickFormat.WebP),
+    (".bmp", MagickFormat.Bmp),
+    (".tif", MagickFormat.Tiff),
+    (".gif", MagickFormat.Gif),
+};
+
+// 中文目录与英文目录各放 6 种格式，覆盖非 ASCII 文件名与含空格的文件名。
+var localeFolders = new (string Folder, string BaseName)[]
+{
+    ("测试素材", "示例图片"),
+    ("samples", "sample image"),
+};
+
+foreach (var (folder, baseName) in localeFolders)
+{
+    var directory = Path.Combine(root, folder);
+    Directory.CreateDirectory(directory);
+
+    for (var index = 0; index < formatMatrix.Length; index++)
+    {
+        var (extension, format) = formatMatrix[index];
+        MakeImage(Path.Combine(directory, $"{baseName} {index + 1}{extension}"), 160, 120, format);
+    }
+}
+
+var localizedFiles = new List<string>();
+foreach (var (folder, _) in localeFolders)
+{
+    localizedFiles.AddRange(ImageFormatCatalog.EnumerateConvertibleFiles(Path.Combine(root, folder)));
+}
+
+Check($"中英文目录共扫描到 12 张常见格式图片（实际 {localizedFiles.Count}）", localizedFiles.Count == 12);
+
+foreach (var cultureName in new[] { "zh-CN", "en-US" })
+{
+    var previousCulture = CultureInfo.CurrentCulture;
+    var previousUiCulture = CultureInfo.CurrentUICulture;
+
+    try
+    {
+        // 切换当前区域，验证转换结果与输出命名不依赖系统的数字/日期格式。
+        CultureInfo.CurrentCulture = new CultureInfo(cultureName);
+        CultureInfo.CurrentUICulture = new CultureInfo(cultureName);
+
+        var cultureOptions = new ConversionOptions
+        {
+            Mode = CompressionMode.Lossless,
+            Effort = 7,
+            Location = OutputLocationMode.CustomFolder,
+            OutputFolder = Path.Combine(root, "locale-" + cultureName),
+        };
+
+        var culturePlan = ConversionPlanner.Build(localizedFiles, cultureOptions);
+        var cultureSummary = await converter.RunAsync(culturePlan, cultureOptions);
+
+        Check($"[{cultureName}] 中英文路径全部转换成功（成功 {cultureSummary.SucceededCount}/12）",
+            cultureSummary.SucceededCount == 12,
+            string.Join("; ", cultureSummary.Outcomes.Where(static o => !o.Succeeded)
+                .Select(static o => $"{Path.GetFileName(o.SourcePath)}: {o.ErrorMessage}")));
+
+        var chineseDestination = culturePlan
+            .FirstOrDefault(static p => p.SourcePath.Contains("测试素材", StringComparison.Ordinal))?.DestinationPath;
+        Check($"[{cultureName}] 中文文件名在输出中保持不变",
+            chineseDestination is not null
+            && Path.GetFileName(chineseDestination).StartsWith("示例图片 1", StringComparison.Ordinal),
+            chineseDestination);
+
+        var englishDestination = culturePlan
+            .FirstOrDefault(static p => p.SourcePath.Contains("samples", StringComparison.Ordinal))?.DestinationPath;
+        Check($"[{cultureName}] 英文文件名（含空格）在输出中保持不变",
+            englishDestination is not null
+            && Path.GetFileName(englishDestination).StartsWith("sample image 1", StringComparison.Ordinal),
+            englishDestination);
+
+        var exact = cultureSummary.Outcomes
+            .Where(static o => o.Succeeded)
+            .Count(static o => RawRgbaHash(o.SourcePath) == RawRgbaHash(o.DestinationPath!));
+        Check($"[{cultureName}] 12 张图全部无损 bit-exact（实际 {exact}/12）", exact == 12);
+    }
+    finally
+    {
+        CultureInfo.CurrentCulture = previousCulture;
+        CultureInfo.CurrentUICulture = previousUiCulture;
+    }
+}
+
+Console.WriteLine();
+Console.WriteLine("== 11. 并行编码：小图并行、大图独占 ==");
+
+var parallelDir = Path.Combine(root, "parallel");
+Directory.CreateDirectory(parallelDir);
+
+for (var index = 0; index < 8; index++)
+{
+    MakeImage(Path.Combine(parallelDir, $"small {index:00}.png"), 512, 512, MagickFormat.Png);
+}
+
+// 超过 100 万像素的图会把批次从并行切回串行，用于覆盖切换路径。
+MakeImage(Path.Combine(parallelDir, "large.png"), 1200, 1200, MagickFormat.Png);
+
+var allParallelFiles = ImageFormatCatalog.EnumerateConvertibleFiles(parallelDir);
+var smallFiles = allParallelFiles
+    .Where(static file => !Path.GetFileName(file).StartsWith("large", StringComparison.Ordinal))
+    .ToList();
+
+var serialOptions = new ConversionOptions
+{
+    Location = OutputLocationMode.CustomFolder,
+    OutputFolder = Path.Combine(root, "parallel-serial"),
+    MaxParallelism = 1,
+};
+
+var autoOptions = new ConversionOptions
+{
+    Location = OutputLocationMode.CustomFolder,
+    OutputFolder = Path.Combine(root, "parallel-auto"),
+    MaxParallelism = 0,
+};
+
+var serialPlan = ConversionPlanner.Build(smallFiles, serialOptions);
+var autoPlan = ConversionPlanner.Build(smallFiles, autoOptions);
+
+var serialWatch = Stopwatch.StartNew();
+var serialSummary = await converter.RunAsync(serialPlan, serialOptions);
+serialWatch.Stop();
+
+var autoWatch = Stopwatch.StartNew();
+var autoSummary = await converter.RunAsync(autoPlan, autoOptions);
+autoWatch.Stop();
+
+Check($"纯小图批次串行与自动并行均成功（{serialSummary.SucceededCount} / {autoSummary.SucceededCount}，共 {smallFiles.Count} 张）",
+    serialSummary.SucceededCount == smallFiles.Count
+    && autoSummary.SucceededCount == smallFiles.Count);
+
+var inconsistent = serialSummary.Outcomes
+    .Where(static o => o.Succeeded)
+    .Count(o =>
+    {
+        var autoDestination = autoPlan
+            .First(p => p.SourcePath == o.SourcePath)
+            .DestinationPath!;
+
+        return RawRgbaHash(o.DestinationPath!) != RawRgbaHash(autoDestination);
+    });
+
+Check("并行输出与串行输出逐像素一致", inconsistent == 0, $"{inconsistent} 个文件不一致");
+
+var speedup = serialWatch.Elapsed.TotalSeconds / Math.Max(autoWatch.Elapsed.TotalSeconds, 0.001);
+Console.WriteLine(
+    $"    {smallFiles.Count} 张 512×512：串行 {serialWatch.Elapsed.TotalSeconds:0.00}s / " +
+    $"自动并行 {autoWatch.Elapsed.TotalSeconds:0.00}s（{speedup:0.0}x）");
+
+// 含大图的混合批次：大图应自动切回独占串行，且不破坏并行段的结果。
+var mixedOptions = new ConversionOptions
+{
+    Location = OutputLocationMode.CustomFolder,
+    OutputFolder = Path.Combine(root, "parallel-mixed"),
+    MaxParallelism = 0,
+};
+
+var mixedPlan = ConversionPlanner.Build(allParallelFiles, mixedOptions);
+var mixedSummary = await converter.RunAsync(mixedPlan, mixedOptions);
+
+Check($"含大图的混合批次全部成功（{mixedSummary.SucceededCount}/{allParallelFiles.Count}）",
+    mixedSummary.SucceededCount == allParallelFiles.Count);
+
+Check("并发数超出范围会被校验拒绝", new ConversionOptions { MaxParallelism = 99 }.Validate() is not null);
+
+// 并行批次中途取消：无论取消发生在哪个时点，每个文件都必须有最终结果，且不抛异常。
+var parallelCancelOptions = new ConversionOptions
+{
+    Location = OutputLocationMode.CustomFolder,
+    OutputFolder = Path.Combine(root, "parallel-cancel"),
+    MaxParallelism = 4,
+};
+
+var parallelCancelPlan = ConversionPlanner.Build(allParallelFiles, parallelCancelOptions);
+using var parallelCancelSource = new CancellationTokenSource();
+var parallelCancelProgress = new Progress<ConversionProgress>(_ => parallelCancelSource.Cancel());
+var parallelCancelSummary = await converter.RunAsync(
+    parallelCancelPlan, parallelCancelOptions, parallelCancelProgress, parallelCancelSource.Token);
+
+Check("并行批次取消后每个文件都有最终结果",
+    parallelCancelSummary.Outcomes.Count == allParallelFiles.Count,
+    $"实际 {parallelCancelSummary.Outcomes.Count}/{allParallelFiles.Count}");
 
 Console.WriteLine();
 Console.WriteLine(new string('=', 60));

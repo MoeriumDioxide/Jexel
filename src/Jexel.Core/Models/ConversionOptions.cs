@@ -11,6 +11,9 @@ public sealed class ConversionOptions
     /// <summary>默认有损质量。</summary>
     public const int DefaultQuality = 90;
 
+    /// <summary>并发编码文件数的硬上限。</summary>
+    public const int MaxParallelismLimit = 8;
+
     /// <summary>压缩模式，默认无损。</summary>
     public CompressionMode Mode { get; set; } = CompressionMode.Lossless;
 
@@ -44,6 +47,15 @@ public sealed class ConversionOptions
     /// </summary>
     public bool PreserveIccProfile { get; set; } = true;
 
+    /// <summary>
+    /// 并发编码的文件数上限。
+    /// <para>
+    /// 0（默认）表示自动：仅当批次里有多张小图时才启用并行，大图始终独占编码。
+    /// 设为 1 可强制完全串行。
+    /// </para>
+    /// </summary>
+    public int MaxParallelism { get; set; }
+
     /// <summary>规范化并校验参数，返回错误信息（null 表示合法）。</summary>
     public string? Validate()
     {
@@ -55,6 +67,11 @@ public sealed class ConversionOptions
         if (Effort is < 1 or > 9)
         {
             return "编码强度必须介于 1 与 9 之间。";
+        }
+
+        if (MaxParallelism is < 0 or > MaxParallelismLimit)
+        {
+            return $"并发数必须介于 0 与 {MaxParallelismLimit} 之间。";
         }
 
         if (Location == OutputLocationMode.CustomFolder && string.IsNullOrWhiteSpace(OutputFolder))
